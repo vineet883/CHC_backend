@@ -1,6 +1,8 @@
 const bcrypt = require("bcryptjs");
 const { pool } = require("../config/db");
-
+const {
+  ensureTodayOpdSessions,
+} = require("../services/opdSessionScheduler");
 // ========================================
 // ADD DOCTOR
 // ========================================
@@ -1240,10 +1242,7 @@ const getRooms = async (req, res, next) => {
       data: rows,
     });
   } catch (error) {
-    console.error(
-      "Get rooms error:",
-      error,
-    );
+    console.error("Get rooms error:", error);
 
     next(error);
   }
@@ -1357,60 +1356,81 @@ const deleteRoom = async (req, res, next) => {
 // ========================================
 
 const assignDoctorToRoom = async (req, res, next) => {
-  const connection = await pool.getConnection();
+  let connection;
 
   try {
-    const {
-      doctorId,
-      roomId,
-      assignmentDate,
-      startTime,
-      consultationStartTime,
-      endTime,
-      isRecurring = true,
-    } = req.body;
+    const { doctorId, roomId, startTime, endTime } = req.body;
 
-    // ========================================
-    // VALIDATION
-    // ========================================
-
-    if (
-      !doctorId ||
-      !roomId ||
-      !assignmentDate ||
-      !startTime ||
-      !consultationStartTime ||
-      !endTime
-    ) {
+    // 1. Validate required fields
+    if (!doctorId || !roomId || !startTime || !endTime) {
       return res.status(400).json({
         success: false,
-        message:
-          "Doctor, room, assignment date, start time, consultation start time and end time are required",
+        message: "doctorId, roomId, startTime and endTime are required",
       });
     }
 
+    // This controller now supports recurring assignments only.
+    const recurring = true;
+
+    // 2. Validate time format
+    const parseTimeToSeconds = (value) => {
+      if (typeof value !== "string") return null;
+
+      const match = value.match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
+
+      if (!match) return null;
+
+      const hours = Number(match[1]);
+      const minutes = Number(match[2]);
+      const seconds = Number(match[3] ?? 0);
+
+      if (hours > 23 || minutes > 59 || seconds > 59) {
+        return null;
+      }
+
+      return hours * 3600 + minutes * 60 + seconds;
+    };
+
+    const startSeconds = parseTimeToSeconds(startTime);
+    const endSeconds = parseTimeToSeconds(endTime);
+
+    if (startSeconds === null || endSeconds === null) {
+      return res.status(400).json({
+        success: false,
+        message: "Time must be a valid HH:mm or HH:mm:ss value",
+      });
+    }
+
+    if (startSeconds >= endSeconds) {
+      return res.status(400).json({
+        success: false,
+        message: "OPD closing time must be after OPD start time",
+      });
+    }
+
+    connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    // ========================================
-    // CHECK DOCTOR
-    // ========================================
+    // 3. Assignment starts from the current database date
+    const [[dateRow]] = await connection.query(
+      "SELECT CURDATE() AS today",
+    );
 
-    const [doctors] = await connection.query(
+    const effectiveDate = dateRow.today;
+
+    // 4. Validate doctor
+    const [[doctor]] = await connection.query(
       `
-      SELECT
-        id,
-        doctor_code,
-        name,
-        specialization,
-        is_active
+      SELECT id, name, specialization, is_active
       FROM doctors
       WHERE id = ?
       LIMIT 1
+      FOR UPDATE
       `,
-      [doctorId]
+      [doctorId],
     );
 
-    if (doctors.length === 0) {
+    if (!doctor) {
       await connection.rollback();
 
       return res.status(404).json({
@@ -1418,8 +1438,6 @@ const assignDoctorToRoom = async (req, res, next) => {
         message: "Doctor not found",
       });
     }
-
-    const doctor = doctors[0];
 
     if (!doctor.is_active) {
       await connection.rollback();
@@ -1430,10 +1448,6 @@ const assignDoctorToRoom = async (req, res, next) => {
       });
     }
 
-    // ========================================
-    // SPECIALIZATION REQUIRED
-    // ========================================
-
     if (!doctor.specialization?.trim()) {
       await connection.rollback();
 
@@ -1443,10 +1457,7 @@ const assignDoctorToRoom = async (req, res, next) => {
       });
     }
 
-    // ========================================
-    // GET DOCTOR WORKING DAYS
-    // ========================================
-
+    // 5. Get doctor's active weekly working days
     const [workingDays] = await connection.query(
       `
       SELECT day_of_week
@@ -1464,7 +1475,7 @@ const assignDoctorToRoom = async (req, res, next) => {
         'SUNDAY'
       )
       `,
-      [doctorId]
+      [doctorId],
     );
 
     if (workingDays.length === 0) {
@@ -1473,69 +1484,27 @@ const assignDoctorToRoom = async (req, res, next) => {
       return res.status(400).json({
         success: false,
         message:
-          "Doctor has no active working days. Please configure working days first.",
+          "Doctor has no active working days. Configure doctor_weekly_schedule first.",
       });
     }
 
-    // ========================================
-    // CHECK SELECTED DATE IS WORKING DAY
-    // ========================================
-
-    const [selectedDayResult] = await connection.query(
-      `
-      SELECT day_of_week
-      FROM doctor_weekly_schedule
-      WHERE doctor_id = ?
-        AND day_of_week = UPPER(DAYNAME(?))
-        AND is_active = TRUE
-      LIMIT 1
-      `,
-      [doctorId, assignmentDate]
+    const workingDayNames = workingDays.map(
+      (row) => row.day_of_week,
     );
 
-    if (selectedDayResult.length === 0) {
-      await connection.rollback();
-
-      const availableDays = workingDays.map(
-        (row) => row.day_of_week
-      );
-
-      const requestedDay = new Date(
-        `${assignmentDate}T00:00:00`
-      )
-        .toLocaleDateString("en-US", {
-          weekday: "long",
-          timeZone: "UTC",
-        })
-        .toUpperCase();
-
-      return res.status(400).json({
-        success: false,
-        message: `Doctor is not available on ${requestedDay}`,
-        requestedDay,
-        workingDays: availableDays,
-      });
-    }
-
-    // ========================================
-    // CHECK ROOM
-    // ========================================
-
-    const [rooms] = await connection.query(
+    // 6. Validate room and lock it
+    const [[room]] = await connection.query(
       `
-      SELECT
-        id,
-        room_number,
-        room_name,
-        is_active
+      SELECT id, room_number, room_name, is_active
       FROM rooms
       WHERE id = ?
       LIMIT 1
+      FOR UPDATE
       `,
-      [roomId]
+      [roomId],
     );
 
-    if (rooms.length === 0) {
+    if (!room) {
       await connection.rollback();
 
       return res.status(404).json({
@@ -1544,7 +1513,7 @@ const assignDoctorToRoom = async (req, res, next) => {
       });
     }
 
-    if (!rooms[0].is_active) {
+    if (!room.is_active) {
       await connection.rollback();
 
       return res.status(400).json({
@@ -1553,159 +1522,154 @@ const assignDoctorToRoom = async (req, res, next) => {
       });
     }
 
-    // ========================================
-    // LOCK ROOM
-    // ========================================
+    // 7. Prevent doctor assignment conflicts.
+    // Check recurring assignments and existing future one-day assignments.
+    const dayPlaceholders = workingDayNames.map(() => "?").join(", ");
 
-    await connection.query(
+    const [duplicateAssignments] = await connection.query(
       `
       SELECT id
-      FROM rooms
-      WHERE id = ?
+      FROM doctor_room_assignments
+      WHERE doctor_id = ?
+        AND is_active = TRUE
+        AND (
+          is_recurring = TRUE
+          OR (
+            is_recurring = FALSE
+            AND assignment_date >= ?
+            AND UPPER(DAYNAME(assignment_date))
+                IN (${dayPlaceholders})
+          )
+        )
+      LIMIT 1
       FOR UPDATE
       `,
-      [roomId]
+      [doctorId, effectiveDate, ...workingDayNames],
     );
 
-    // ========================================
-    // CHECK EXISTING ASSIGNMENT
-    //
-    // For normal assignment:
-    // same doctor + same date
-    //
-    // For recurring assignment:
-    // same doctor + same room + recurring
-    // ========================================
-
-    let existingAssignmentQuery;
-    let existingAssignmentParams;
-
-    if (Boolean(isRecurring)) {
-      existingAssignmentQuery = `
-        SELECT id
-        FROM doctor_room_assignments
-        WHERE doctor_id = ?
-          AND room_id = ?
-          AND is_recurring = TRUE
-          AND is_active = TRUE
-        LIMIT 1
-      `;
-
-      existingAssignmentParams = [
-        doctorId,
-        roomId,
-      ];
-    } else {
-      existingAssignmentQuery = `
-        SELECT id
-        FROM doctor_room_assignments
-        WHERE doctor_id = ?
-          AND assignment_date = ?
-          AND is_active = TRUE
-        LIMIT 1
-      `;
-
-      existingAssignmentParams = [
-        doctorId,
-        assignmentDate,
-      ];
-    }
-
-    const [existingAssignment] =
-      await connection.query(
-        existingAssignmentQuery,
-        existingAssignmentParams
-      );
-
-    if (existingAssignment.length > 0) {
-      await connection.rollback();
-
-      return res.status(409).json({
-        success: false,
-        message: Boolean(isRecurring)
-          ? "Doctor already has a recurring room assignment"
-          : "Doctor is already assigned for this date",
-      });
-    }
-
-    // ========================================
-    // CHECK ROOM DOCTOR LIMIT
-    // MAX 3 DOCTORS PER ROOM PER DATE
-    //
-    // IMPORTANT:
-    // recurring assignment itself should not
-    // count as a permanent date assignment.
-    // ========================================
-
-    const [roomAssignments] = await connection.query(
-      `
-      SELECT
-        dra.id,
-        dra.doctor_id,
-        d.name AS doctor_name,
-        dra.start_time,
-        dra.end_time
-      FROM doctor_room_assignments dra
-
-      INNER JOIN doctors d
-        ON d.id = dra.doctor_id
-
-      WHERE dra.room_id = ?
-        AND dra.assignment_date = ?
-        AND dra.is_active = TRUE
-
-      ORDER BY dra.id ASC
-      `,
-      [roomId, assignmentDate]
-    );
-
-    if (roomAssignments.length >= 3) {
+    if (duplicateAssignments.length > 0) {
       await connection.rollback();
 
       return res.status(409).json({
         success: false,
         message:
-          "Maximum 3 doctors can be assigned to this room for this date",
+          "Doctor already has an active recurring assignment or a conflicting future one-day assignment",
+      });
+    }
 
-        roomId,
-        assignmentDate,
+    // 8. Check room capacity for every active weekday.
+    // Existing recurring and legacy one-day assignments are considered.
+    // Maximum 3 active doctors per room on an applicable date.
+    for (const { day_of_week: targetDay } of workingDays) {
+      const [roomAssignments] = await connection.query(
+        `
+        SELECT DISTINCT
+          dra.id,
+          dra.doctor_id,
+          d.name AS doctor_name,
+          dra.assignment_date,
+          dra.is_recurring,
+          dra.start_time,
+          dra.end_time
+        FROM doctor_room_assignments dra
+        INNER JOIN doctors d
+          ON d.id = dra.doctor_id
+         AND d.is_active = TRUE
+        WHERE dra.room_id = ?
+          AND dra.is_active = TRUE
+          AND (
+            (
+              dra.is_recurring = TRUE
+              AND dra.assignment_date <= ?
+              AND EXISTS (
+                SELECT 1
+                FROM doctor_weekly_schedule dws
+                WHERE dws.doctor_id = dra.doctor_id
+                  AND dws.day_of_week = ?
+                  AND dws.is_active = TRUE
+              )
+            )
+            OR (
+              dra.is_recurring = FALSE
+              AND dra.assignment_date >= ?
+              AND UPPER(DAYNAME(dra.assignment_date)) = ?
+            )
+          )
+        `,
+        [
+          roomId,
+          effectiveDate,
+          targetDay,
+          effectiveDate,
+          targetDay,
+        ],
+      );
 
-        assignedDoctors:
-          roomAssignments.map((row) => ({
+      const recurringCount = roomAssignments.filter(
+        (row) => Number(row.is_recurring) === 1,
+      ).length;
+
+      const oneTimeCountsByDate = new Map();
+
+      for (const row of roomAssignments) {
+        if (Number(row.is_recurring) === 1) continue;
+
+        const dateKey = String(row.assignment_date).slice(0, 10);
+
+        oneTimeCountsByDate.set(
+          dateKey,
+          (oneTimeCountsByDate.get(dateKey) || 0) + 1,
+        );
+      }
+
+      const overCapacityDate = [
+        ...oneTimeCountsByDate.entries(),
+      ].find(
+        ([, oneTimeCount]) =>
+          recurringCount + oneTimeCount >= 3,
+      );
+
+      const baselineOverCapacity = recurringCount >= 3;
+
+      if (baselineOverCapacity || overCapacityDate) {
+        await connection.rollback();
+
+        return res.status(409).json({
+          success: false,
+          message:
+            "Maximum 3 doctors can be assigned to this room per working date",
+          roomId,
+          weekday: targetDay,
+          assignmentDate: overCapacityDate?.[0] || effectiveDate,
+          assignedDoctors: roomAssignments.map((row) => ({
             doctorId: row.doctor_id,
             doctorName: row.doctor_name,
             startTime: row.start_time,
             endTime: row.end_time,
+            isRecurring: Number(row.is_recurring) === 1,
+            assignmentDate: row.assignment_date,
           })),
-      });
+        });
+      }
     }
 
-    // ========================================
-    // GET / CREATE SPECIALIZATION
-    // ========================================
-
-    const specializationName =
-      doctor.specialization.trim();
+    // 9. Find or create specialization
+    const specializationName = doctor.specialization.trim();
 
     let specializationId;
 
-    const [specializations] =
-      await connection.query(
-        `
-        SELECT
-          id,
-          is_active
-        FROM specializations
-        WHERE LOWER(TRIM(name)) =
-              LOWER(TRIM(?))
-        LIMIT 1
-        `,
-        [specializationName]
-      );
+    const [specializations] = await connection.query(
+      `
+      SELECT id, is_active
+      FROM specializations
+      WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))
+      LIMIT 1
+      `,
+      [specializationName],
+    );
 
     if (specializations.length > 0) {
-      specializationId =
-        specializations[0].id;
+      specializationId = specializations[0].id;
 
       if (!specializations[0].is_active) {
         await connection.query(
@@ -1714,65 +1678,42 @@ const assignDoctorToRoom = async (req, res, next) => {
           SET is_active = TRUE
           WHERE id = ?
           `,
-          [specializationId]
+          [specializationId],
         );
       }
     } else {
-      const [specializationResult] =
-        await connection.query(
-          `
-          INSERT INTO specializations
-          (
-            name,
-            description,
-            is_active
-          )
-          VALUES (?, ?, TRUE)
-          `,
-          [
-            specializationName,
-            null,
-          ]
-        );
-
-      specializationId =
-        specializationResult.insertId;
-    }
-
-    // ========================================
-    // ROOM ↔ SPECIALIZATION
-    // ========================================
-
-    const [roomSpecialization] =
-      await connection.query(
+      const [specializationResult] = await connection.query(
         `
-        SELECT id
-        FROM room_specializations
-        WHERE room_id = ?
-          AND specialization_id = ?
-        LIMIT 1
+        INSERT INTO specializations
+          (name, description, is_active)
+        VALUES (?, NULL, TRUE)
         `,
-        [
-          roomId,
-          specializationId,
-        ]
+        [specializationName],
       );
 
-    if (roomSpecialization.length === 0) {
+      specializationId = specializationResult.insertId;
+    }
+
+    // 10. Map room to specialization
+    const [roomSpecializations] = await connection.query(
+      `
+      SELECT id
+      FROM room_specializations
+      WHERE room_id = ?
+        AND specialization_id = ?
+      LIMIT 1
+      `,
+      [roomId, specializationId],
+    );
+
+    if (roomSpecializations.length === 0) {
       await connection.query(
         `
         INSERT INTO room_specializations
-        (
-          room_id,
-          specialization_id,
-          is_active
-        )
+          (room_id, specialization_id, is_active)
         VALUES (?, ?, TRUE)
         `,
-        [
-          roomId,
-          specializationId,
-        ]
+        [roomId, specializationId],
       );
     } else {
       await connection.query(
@@ -1781,153 +1722,93 @@ const assignDoctorToRoom = async (req, res, next) => {
         SET is_active = TRUE
         WHERE id = ?
         `,
-        [roomSpecialization[0].id]
+        [roomSpecializations[0].id],
       );
     }
 
-    // ========================================
-    // CREATE DOCTOR ROOM ASSIGNMENT
-    //
-    // assignment_date = selected/start date
-    // is_recurring = TRUE means:
-    // assignment continues according to
-    // doctor_weekly_schedule
-    // ========================================
+    // 11. Create recurring doctor-room assignment.
+   
+    // Consultation starts at the same time as OPD.
+    const [assignmentResult] = await connection.query(
+      `
+      INSERT INTO doctor_room_assignments
+      (
+        doctor_id,
+        room_id,
+        assignment_date,
+        start_time,
+        end_time,
+        is_active,
+        is_recurring
+      )
+      VALUES (?, ?, ?, ?, ?, ?, TRUE, TRUE)
+      `,
+      [
+        doctorId,
+        roomId,
+        effectiveDate,
+        startTime,
+        startTime,
+        endTime,
+      ],
+    );
 
-    const [assignmentResult] =
-      await connection.query(
-        `
-        INSERT INTO doctor_room_assignments
-        (
-          doctor_id,
-          room_id,
-          assignment_date,
-          start_time,
-          end_time,
-          is_active,
-          is_recurring
-        )
-        VALUES (?, ?, ?, ?, ?, TRUE, ?)
-        `,
-        [
-          doctorId,
-          roomId,
-          assignmentDate,
-          startTime,
-          endTime,
-          Boolean(isRecurring),
-        ]
-      );
-
-    // ========================================
-    // CREATE OPD SESSION
-    //
-    // Create session for the selected/start date
-    // ========================================
-
-    const [sessionResult] =
-      await connection.query(
-        `
-        INSERT INTO opd_sessions
-        (
-          room_id,
-          doctor_id,
-          opd_date,
-          token_start_time,
-          consultation_start_time,
-          token_close_time,
-          status
-        )
-        VALUES (?, ?, ?, ?, ?, ?, 'NOT_STARTED')
-        `,
-        [
-          roomId,
-          doctorId,
-          assignmentDate,
-          startTime,
-          consultationStartTime,
-          endTime,
-        ]
-      );
-
-    // ========================================
-    // COMMIT
-    // ========================================
+    // Do not create an OPD session here.
+    // The scheduler creates sessions on the doctor's active working days.
 
     await connection.commit();
 
-    // ========================================
-    // RESPONSE
-    // ========================================
-
     return res.status(201).json({
       success: true,
-
-      message: Boolean(isRecurring)
-        ? "Doctor assigned to room with recurring weekly schedule"
-        : "Doctor assigned to room successfully",
-
+      message:
+        "Recurring room assignment created. OPD sessions will be generated on the doctor's active working days.",
       data: {
-        assignmentId:
-          assignmentResult.insertId,
-
-        opdSessionId:
-          sessionResult.insertId,
-
+        assignmentId: assignmentResult.insertId,
         doctorId,
+        doctorName: doctor.name,
         roomId,
-
+        roomNumber: room.room_number,
         specializationId,
-        specialization:
-          specializationName,
-
-        assignmentDate,
-
+        specialization: specializationName,
+        assignmentDate: effectiveDate,
         startTime,
-        consultationStartTime,
+        consultationStartTime: startTime,
         endTime,
-
-        isRecurring:
-          Boolean(isRecurring),
-
-        workingDays:
-          workingDays.map(
-            (row) => row.day_of_week
-          ),
+        isRecurring: recurring,
+        workingDays: workingDays.map(
+          (row) => row.day_of_week,
+        ),
       },
     });
   } catch (error) {
-    try {
-      await connection.rollback();
-    } catch {}
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch {}
+    }
 
-    console.error(
-      "Assign doctor to room error:",
-      error
-    );
+    console.error("Assign doctor to room error:", error);
 
     if (error.code === "ER_DUP_ENTRY") {
       return res.status(409).json({
         success: false,
-        message:
-          "Doctor-room assignment or OPD session already exists",
+        message: "Duplicate doctor-room assignment",
       });
     }
 
-    next(error);
+    return next(error);
   } finally {
-    connection.release();
+    if (connection) {
+      connection.release();
+    }
   }
 };
+
 // ========================================
 // GET ASSIGNMENTS
 // ========================================
 
-const getDoctorRoomAssignments = async (
-  req,
-  res,
-  next,
-) => {
+const getDoctorRoomAssignments = async (req, res, next) => {
   try {
     const [rows] = await pool.query(
       `
@@ -1966,10 +1847,7 @@ const getDoctorRoomAssignments = async (
       data: rows,
     });
   } catch (error) {
-    console.error(
-      "Get doctor room assignments error:",
-      error,
-    );
+    console.error("Get doctor room assignments error:", error);
 
     next(error);
   }
@@ -1979,29 +1857,23 @@ const getDoctorRoomAssignments = async (
 // UPDATE DOCTOR ROOM ASSIGNMENT
 // ========================================
 
-const updateDoctorRoomAssignment = async (
-  req,
-  res,
-  next,
-) => {
-  const connection = await pool.getConnection();
+const updateDoctorRoomAssignment = async (req, res, next) => {
+  let connection;
 
   try {
     const { id } = req.params;
-
     const {
       doctorId,
       roomId,
-      assignmentDate,
       startTime,
       endTime,
       isActive,
     } = req.body;
 
-    // ========================================
-    // GET EXISTING ASSIGNMENT
-    // ========================================
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
 
+    // 1. Get existing assignment
     const [existingRows] = await connection.query(
       `
       SELECT
@@ -2011,15 +1883,19 @@ const updateDoctorRoomAssignment = async (
         assignment_date,
         start_time,
         end_time,
-        is_active
+        is_active,
+        is_recurring
       FROM doctor_room_assignments
       WHERE id = ?
       LIMIT 1
+      FOR UPDATE
       `,
       [id],
     );
 
     if (existingRows.length === 0) {
+      await connection.rollback();
+
       return res.status(404).json({
         success: false,
         message: "Assignment not found",
@@ -2028,62 +1904,99 @@ const updateDoctorRoomAssignment = async (
 
     const existing = existingRows[0];
 
-    // ========================================
-    // FINAL VALUES
-    // ========================================
-
+    // 2. Resolve final values
     const finalDoctorId =
-      doctorId !== undefined &&
-      doctorId !== null
+      doctorId !== undefined && doctorId !== null
         ? doctorId
         : existing.doctor_id;
 
     const finalRoomId =
-      roomId !== undefined &&
-      roomId !== null
+      roomId !== undefined && roomId !== null
         ? roomId
         : existing.room_id;
 
-    const finalDate =
-      assignmentDate || existing.assignment_date;
+    // Recurring assignment ki original start date retain hogi.
+    const finalDate = existing.assignment_date;
 
     const finalStartTime =
-      startTime || existing.start_time;
+      startTime !== undefined && startTime !== null
+        ? startTime
+        : existing.start_time;
 
     const finalEndTime =
-      endTime || existing.end_time;
+      endTime !== undefined && endTime !== null
+        ? endTime
+        : existing.end_time;
 
     const finalIsActive =
-      isActive !== undefined
-        ? Boolean(isActive)
-        : Boolean(existing.is_active);
+      isActive === undefined
+        ? Boolean(existing.is_active)
+        : (
+            isActive === true ||
+            isActive === 1 ||
+            isActive === "1" ||
+            String(isActive).toLowerCase() === "true"
+          );
 
-    // ========================================
-    // START TRANSACTION
-    // ========================================
+    // 3. Validate time values
+    const parseTimeToSeconds = (value) => {
+      if (typeof value !== "string") return null;
 
-    await connection.beginTransaction();
+      const match = value.match(
+        /^(\d{2}):(\d{2})(?::(\d{2}))?$/,
+      );
 
-    // ========================================
-    // CHECK DOCTOR
-    // ========================================
+      if (!match) return null;
 
-    const [doctors] = await connection.query(
+      const hours = Number(match[1]);
+      const minutes = Number(match[2]);
+      const seconds = Number(match[3] ?? 0);
+
+      if (hours > 23 || minutes > 59 || seconds > 59) {
+        return null;
+      }
+
+      return hours * 3600 + minutes * 60 + seconds;
+    };
+
+    const startSeconds = parseTimeToSeconds(finalStartTime);
+    const endSeconds = parseTimeToSeconds(finalEndTime);
+
+    if (startSeconds === null || endSeconds === null) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        success: false,
+        message: "Time must be a valid HH:mm or HH:mm:ss value",
+      });
+    }
+
+    if (startSeconds >= endSeconds) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        success: false,
+        message: "OPD closing time must be after OPD start time",
+      });
+    }
+
+    // 4. Validate doctor
+    const [[doctor]] = await connection.query(
       `
       SELECT
         id,
-        doctor_code,
         name,
         specialization,
         is_active
       FROM doctors
       WHERE id = ?
       LIMIT 1
+      FOR UPDATE
       `,
       [finalDoctorId],
     );
 
-    if (doctors.length === 0) {
+    if (!doctor) {
       await connection.rollback();
 
       return res.status(404).json({
@@ -2091,8 +2004,6 @@ const updateDoctorRoomAssignment = async (
         message: "Doctor not found",
       });
     }
-
-    const doctor = doctors[0];
 
     if (!doctor.is_active) {
       await connection.rollback();
@@ -2103,86 +2014,63 @@ const updateDoctorRoomAssignment = async (
       });
     }
 
-    // ========================================
-    // CHECK DOCTOR WEEKLY WORKING DAY
-    // ========================================
+    if (!doctor.specialization?.trim()) {
+      await connection.rollback();
 
-    const [weeklySchedule] = await connection.query(
+      return res.status(400).json({
+        success: false,
+        message: "Doctor does not have a specialization",
+      });
+    }
+
+    // 5. Get doctor's active weekly working days
+    const [workingDays] = await connection.query(
       `
       SELECT day_of_week
       FROM doctor_weekly_schedule
       WHERE doctor_id = ?
-        AND day_of_week = UPPER(DAYNAME(?))
         AND is_active = TRUE
-      LIMIT 1
+      ORDER BY FIELD(
+        day_of_week,
+        'MONDAY',
+        'TUESDAY',
+        'WEDNESDAY',
+        'THURSDAY',
+        'FRIDAY',
+        'SATURDAY',
+        'SUNDAY'
+      )
       `,
-      [finalDoctorId, finalDate],
+      [finalDoctorId],
     );
 
-    if (weeklySchedule.length === 0) {
+    if (workingDays.length === 0) {
       await connection.rollback();
-
-      const [workingDays] = await connection.query(
-        `
-        SELECT day_of_week
-        FROM doctor_weekly_schedule
-        WHERE doctor_id = ?
-          AND is_active = TRUE
-        ORDER BY FIELD(
-          day_of_week,
-          'MONDAY',
-          'TUESDAY',
-          'WEDNESDAY',
-          'THURSDAY',
-          'FRIDAY',
-          'SATURDAY',
-          'SUNDAY'
-        )
-        `,
-        [finalDoctorId],
-      );
-
-      const availableDays = workingDays.map(
-        (row) => row.day_of_week,
-      );
-
-      const requestedDay = new Date(
-        `${finalDate}T00:00:00`,
-      )
-        .toLocaleDateString("en-US", {
-          weekday: "long",
-          timeZone: "UTC",
-        })
-        .toUpperCase();
 
       return res.status(400).json({
         success: false,
         message:
-          `Doctor is not available on ${requestedDay}`,
-        requestedDay,
-        workingDays: availableDays,
+          "Doctor has no active working days. Configure doctor_weekly_schedule first.",
       });
     }
 
-    // ========================================
-    // CHECK ROOM
-    // ========================================
+    const workingDayNames = workingDays.map(
+      (row) => row.day_of_week,
+    );
 
-    const [rooms] = await connection.query(
+    // 6. Validate room
+    const [[room]] = await connection.query(
       `
-      SELECT
-        id,
-        room_number,
-        room_name,
-        is_active
+      SELECT id, room_number, room_name, is_active
       FROM rooms
       WHERE id = ?
       LIMIT 1
+      FOR UPDATE
       `,
       [finalRoomId],
     );
 
-    if (rooms.length === 0) {
+    if (!room) {
       await connection.rollback();
 
       return res.status(404).json({
@@ -2191,7 +2079,7 @@ const updateDoctorRoomAssignment = async (
       });
     }
 
-    if (!rooms[0].is_active) {
+    if (!room.is_active) {
       await connection.rollback();
 
       return res.status(400).json({
@@ -2200,247 +2088,195 @@ const updateDoctorRoomAssignment = async (
       });
     }
 
-    // ========================================
-    // IF ACTIVE:
-    // LOCK ROOM + CHECK LIMIT
-    // ========================================
-
+    // 7. Check conflicts and room capacity only
+    // when the assignment will remain active.
     if (finalIsActive) {
-      // Lock room
-      await connection.query(
+      // Prevent the same doctor from having another
+      // recurring assignment or a conflicting legacy one-day assignment.
+      const dayPlaceholders = workingDayNames
+        .map(() => "?")
+        .join(", ");
+
+      const [duplicateAssignments] = await connection.query(
         `
         SELECT id
-        FROM rooms
-        WHERE id = ?
+        FROM doctor_room_assignments
+        WHERE doctor_id = ?
+          AND is_active = TRUE
+          AND id != ?
+          AND (
+            is_recurring = TRUE
+            OR (
+              is_recurring = FALSE
+              AND assignment_date >= CURDATE()
+              AND UPPER(DAYNAME(assignment_date))
+                  IN (${dayPlaceholders})
+            )
+          )
+        LIMIT 1
         FOR UPDATE
         `,
-        [finalRoomId],
+        [finalDoctorId, id, ...workingDayNames],
       );
 
-      // ========================================
-      // CHECK DOCTOR DUPLICATE ASSIGNMENT
-      // SAME DOCTOR + SAME DATE
-      // ========================================
-
-      const [doctorAssignments] =
-        await connection.query(
-          `
-          SELECT id
-          FROM doctor_room_assignments
-          WHERE
-            doctor_id = ?
-            AND assignment_date = ?
-            AND is_active = TRUE
-            AND id != ?
-          LIMIT 1
-          `,
-          [
-            finalDoctorId,
-            finalDate,
-            id,
-          ],
-        );
-
-      if (doctorAssignments.length > 0) {
+      if (duplicateAssignments.length > 0) {
         await connection.rollback();
 
         return res.status(409).json({
           success: false,
           message:
-            "Doctor is already assigned for this date",
+            "Doctor already has an active recurring assignment or a conflicting future assignment",
         });
       }
 
-      // ========================================
-      // CHECK ROOM DOCTOR LIMIT
-      // MAX 3 DOCTORS PER ROOM PER DATE
-      // SAME TIME IS ALLOWED
-      // ========================================
-
-      const [roomAssignments] =
-        await connection.query(
+      // Check maximum 3 doctors in the selected room
+      // on every active weekday of this doctor.
+      for (const { day_of_week: targetDay } of workingDays) {
+        const [roomAssignments] = await connection.query(
           `
-          SELECT
+          SELECT DISTINCT
             dra.id,
             dra.doctor_id,
             d.name AS doctor_name,
+            dra.assignment_date,
+            dra.is_recurring,
             dra.start_time,
             dra.end_time
           FROM doctor_room_assignments dra
-
           INNER JOIN doctors d
             ON d.id = dra.doctor_id
-
-          WHERE
-            dra.room_id = ?
-            AND dra.assignment_date = ?
+           AND d.is_active = TRUE
+          WHERE dra.room_id = ?
             AND dra.is_active = TRUE
             AND dra.id != ?
-
-          ORDER BY dra.id ASC
+            AND (
+              (
+                dra.is_recurring = TRUE
+                AND dra.assignment_date <= CURDATE()
+                AND EXISTS (
+                  SELECT 1
+                  FROM doctor_weekly_schedule dws
+                  WHERE dws.doctor_id = dra.doctor_id
+                    AND dws.day_of_week = ?
+                    AND dws.is_active = TRUE
+                )
+              )
+              OR (
+                dra.is_recurring = FALSE
+                AND dra.assignment_date >= CURDATE()
+                AND UPPER(DAYNAME(dra.assignment_date)) = ?
+              )
+            )
           `,
-          [
-            finalRoomId,
-            finalDate,
-            id,
-          ],
+          [finalRoomId, id, targetDay, targetDay],
         );
 
-      // Maximum 3 doctors
-      if (roomAssignments.length >= 3) {
-        await connection.rollback();
+        const recurringCount = roomAssignments.filter(
+          (row) => Number(row.is_recurring) === 1,
+        ).length;
 
-        return res.status(409).json({
-          success: false,
+        const oneTimeCountsByDate = new Map();
 
-          message:
-            "Maximum 3 doctors can be assigned to this room for this date",
+        for (const row of roomAssignments) {
+          if (Number(row.is_recurring) === 1) continue;
 
-          roomId: finalRoomId,
+          const dateKey = String(row.assignment_date).slice(0, 10);
 
-          assignmentDate: finalDate,
+          oneTimeCountsByDate.set(
+            dateKey,
+            (oneTimeCountsByDate.get(dateKey) || 0) + 1,
+          );
+        }
 
-          assignedDoctors:
-            roomAssignments.map((row) => ({
+        const overCapacityDate = [
+          ...oneTimeCountsByDate.entries(),
+        ].find(
+          ([, oneTimeCount]) =>
+            recurringCount + oneTimeCount >= 3,
+        );
+
+        if (
+          recurringCount >= 3 ||
+          overCapacityDate
+        ) {
+          await connection.rollback();
+
+          return res.status(409).json({
+            success: false,
+            message:
+              "Maximum 3 doctors can be assigned to this room per working date",
+            roomId: finalRoomId,
+            weekday: targetDay,
+            assignmentDate: overCapacityDate?.[0] || finalDate,
+            assignedDoctors: roomAssignments.map((row) => ({
               doctorId: row.doctor_id,
               doctorName: row.doctor_name,
               startTime: row.start_time,
               endTime: row.end_time,
+              isRecurring: Number(row.is_recurring) === 1,
+              assignmentDate: row.assignment_date,
             })),
-        });
+          });
+        }
       }
     }
 
-    // ========================================
-    // UPDATE ASSIGNMENT
-    // ========================================
-
+    // 8. Update recurring assignment.
+    // Keep the legacy consultation column for DB compatibility.
+    // Consultation start time = OPD start time.
     await connection.query(
       `
       UPDATE doctor_room_assignments
       SET
         doctor_id = ?,
         room_id = ?,
-        assignment_date = ?,
         start_time = ?,
         end_time = ?,
-        is_active = ?
+        is_active = ?,
+        is_recurring = TRUE
       WHERE id = ?
       `,
       [
         finalDoctorId,
         finalRoomId,
-        finalDate,
+        finalStartTime,
         finalStartTime,
         finalEndTime,
-        finalIsActive,
+        finalIsActive ? 1 : 0,
         id,
       ],
     );
 
-    // ========================================
-    // UPDATE OPD SESSION
-    // ========================================
-
-    const [sessionResult] =
-      await connection.query(
-        `
-        UPDATE opd_sessions
-        SET
-          doctor_id = ?,
-          room_id = ?,
-          opd_date = ?,
-          token_start_time = ?,
-          token_close_time = ?
-
-        WHERE
-          doctor_id = ?
-          AND room_id = ?
-          AND opd_date = ?
-        `,
-        [
-          finalDoctorId,
-          finalRoomId,
-          finalDate,
-          finalStartTime,
-          finalEndTime,
-
-          existing.doctor_id,
-          existing.room_id,
-          existing.assignment_date,
-        ],
-      );
-
-    // ========================================
-    // IF OPD SESSION DOES NOT EXIST
-    // CREATE NEW ONE
-    // ========================================
-
-    if (
-      sessionResult.affectedRows === 0 &&
-      finalIsActive
-    ) {
-      await connection.query(
-        `
-        INSERT INTO opd_sessions
-        (
-          room_id,
-          doctor_id,
-          opd_date,
-          token_start_time,
-          consultation_start_time,
-          token_close_time,
-          status
-        )
-        VALUES (?, ?, ?, ?, ?, ?, 'NOT_STARTED')
-        `,
-        [
-          finalRoomId,
-          finalDoctorId,
-          finalDate,
-          finalStartTime,
-          finalStartTime,
-          finalEndTime,
-        ],
-      );
-    }
-
-    // ========================================
-    // COMMIT
-    // ========================================
-
     await connection.commit();
-
-    // ========================================
-    // RESPONSE
-    // ========================================
 
     return res.status(200).json({
       success: true,
-
-      message:
-        "Doctor-room assignment and OPD session updated successfully",
-
+      message: finalIsActive
+        ? "Recurring doctor-room assignment updated successfully. OPD sessions follow the doctor's active working days."
+        : "Recurring doctor-room assignment deactivated successfully.",
       data: {
         id: Number(id),
-
         doctorId: finalDoctorId,
-
+        doctorName: doctor.name,
         roomId: finalRoomId,
-
+        roomNumber: room.room_number,
         assignmentDate: finalDate,
-
         startTime: finalStartTime,
-
+        consultationStartTime: finalStartTime,
         endTime: finalEndTime,
-
         isActive: finalIsActive,
+        isRecurring: true,
+        workingDays: workingDays.map(
+          (row) => row.day_of_week,
+        ),
       },
     });
   } catch (error) {
-    try {
-      await connection.rollback();
-    } catch {}
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch {}
+    }
 
     console.error(
       "Update doctor-room assignment error:",
@@ -2450,14 +2286,15 @@ const updateDoctorRoomAssignment = async (
     if (error.code === "ER_DUP_ENTRY") {
       return res.status(409).json({
         success: false,
-        message:
-          "Doctor-room assignment or OPD session already exists",
+        message: "Doctor-room assignment already exists",
       });
     }
 
-    next(error);
+    return next(error);
   } finally {
-    connection.release();
+    if (connection) {
+      connection.release();
+    }
   }
 };
 
@@ -3698,199 +3535,10 @@ const getInventoryTransactions = async (req, res, next) => {
   }
 };
 
-// START OPD
-// START OPD
-const startOpd = async (req, res, next) => {
-  const connection = await pool.getConnection();
-
-  try {
-    const { opdSessionId, roomId } = req.body;
-
-    if (!opdSessionId && !roomId) {
-      return res.status(400).json({
-        success: false,
-        message: "opdSessionId or roomId is required",
-      });
-    }
-
-    await connection.beginTransaction();
-
-    let sessionId = opdSessionId;
-
-    // ========================================
-    // CASE 1: Session ID already exists
-    // ========================================
-    if (opdSessionId) {
-      const [result] = await connection.query(
-        `
-        UPDATE opd_sessions
-        SET
-          status = 'RUNNING',
-          started_at = NOW(),
-          ended_at = NULL
-        WHERE id = ?
-          AND opd_date = CURDATE()
-          AND status = 'NOT_STARTED'
-        `,
-        [opdSessionId],
-      );
-
-      if (result.affectedRows === 0) {
-        await connection.rollback();
-
-        return res.status(400).json({
-          success: false,
-          message: "OPD cannot be started",
-        });
-      }
-    }
-
-    // ========================================
-    // CASE 2: No session exists
-    // Create today's session
-    // ========================================
-    else {
-      const [assignments] = await connection.query(
-        `
-        SELECT
-          dra.doctor_id,
-          dra.room_id
-        FROM doctor_room_assignments dra
-        WHERE dra.room_id = ?
-          AND dra.assignment_date = CURDATE()
-          AND dra.is_active = 1
-        LIMIT 1
-        `,
-        [roomId],
-      );
-
-      if (assignments.length === 0) {
-        await connection.rollback();
-
-        return res.status(404).json({
-          success: false,
-          message: "No active doctor assignment found for this room",
-        });
-      }
-
-      const { doctor_id, room_id } = assignments[0];
-
-      // Check whether session was created by another request
-      const [existingSessions] = await connection.query(
-        `
-        SELECT id, status
-        FROM opd_sessions
-        WHERE doctor_id = ?
-          AND room_id = ?
-          AND opd_date = CURDATE()
-        LIMIT 1
-        `,
-        [doctor_id, room_id],
-      );
-
-      if (existingSessions.length > 0) {
-        sessionId = existingSessions[0].id;
-
-        if (existingSessions[0].status !== "NOT_STARTED") {
-          await connection.rollback();
-
-          return res.status(400).json({
-            success: false,
-            message: `OPD is already ${existingSessions[0].status}`,
-          });
-        }
-
-        await connection.query(
-          `
-          UPDATE opd_sessions
-          SET
-            status = 'RUNNING',
-            started_at = NOW(),
-            ended_at = NULL
-          WHERE id = ?
-          `,
-          [sessionId],
-        );
-      } else {
-        const [insertResult] = await connection.query(
-          `
-          INSERT INTO opd_sessions
-          (
-            doctor_id,
-            room_id,
-            opd_date,
-            status,
-            started_at
-          )
-          VALUES (?, ?, CURDATE(), 'RUNNING', NOW())
-          `,
-          [doctor_id, room_id],
-        );
-
-        sessionId = insertResult.insertId;
-      }
-    }
-
-    await connection.commit();
-
-    return res.status(200).json({
-      success: true,
-      message: "OPD started successfully",
-      status: "RUNNING",
-      opdSessionId: sessionId,
-    });
-  } catch (error) {
-    await connection.rollback();
-    next(error);
-  } finally {
-    connection.release();
-  }
-};
-
-// END OPD
-const endOpd = async (req, res, next) => {
-  try {
-    const { opdSessionId } = req.body;
-
-    if (!opdSessionId) {
-      return res.status(400).json({
-        success: false,
-        message: "opdSessionId is required",
-      });
-    }
-
-    const [result] = await pool.query(
-      `
-        UPDATE opd_sessions
-        SET
-          status = 'ENDED',
-          ended_at = NOW()
-        WHERE id = ?
-          AND opd_date = CURDATE()
-          AND status = 'RUNNING'
-        `,
-      [opdSessionId],
-    );
-
-    if (result.affectedRows === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "OPD cannot be ended",
-      });
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: "OPD ended successfully",
-      status: "ENDED",
-    });
-  } catch (error) {
-    next(error);
-  }
-};
 
 const getTodayOpd = async (req, res, next) => {
   try {
+    await ensureTodayOpdSessions();
     const [rows] = await pool.query(`
       SELECT
         r.id AS roomId,
@@ -3976,7 +3624,8 @@ LEFT JOIN doctor_room_assignments dra
       data,
     });
   } catch (error) {
-    next(error);
+    console.error("Get today OPD error:", error);
+    return next(error);
   }
 };
 module.exports = {
@@ -3994,8 +3643,7 @@ module.exports = {
   getDoctorRoomAssignments,
   updateDoctorRoomAssignment,
 
-  startOpd,
-  endOpd,
+
   getTodayOpd,
 
   getInventoryTransactions,

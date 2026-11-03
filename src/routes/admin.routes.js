@@ -67,8 +67,7 @@ const {
   // =========================
   // OPD
   // =========================
-  startOpd,
-  endOpd,
+
   getTodayOpd,
 } = require("../controllers/admin.controller");
 
@@ -207,15 +206,7 @@ router.get(
 // OPD
 // ======================================================
 
-router.post(
-  "/opd/start",
-  startOpd
-);
 
-router.post(
-  "/opd/end",
-  endOpd
-);
 router.get(
   "/opd/today",
   getTodayOpd

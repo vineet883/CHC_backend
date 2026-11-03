@@ -396,7 +396,6 @@ const updatePatientProfile = async (req, res, next) => {
 
 // ======================================================
 // SEARCH DISEASE / SPECIALIZATION
-// GET /api/patient/search?search=...
 // ======================================================
 
 const searchDiseaseSpecialization = async (req, res, next) => {
@@ -472,7 +471,6 @@ const searchDiseaseSpecialization = async (req, res, next) => {
 
 // ======================================================
 // GET AVAILABLE OPD OPTIONS
-// GET /api/patient/opd-options
 // ======================================================
 
 const getOpdOptions = async (req, res, next) => {
@@ -608,7 +606,6 @@ const getOpdOptions = async (req, res, next) => {
 
 // ======================================================
 // BOOK OPD / GENERATE TOKEN
-// POST /api/patient/tokens
 // ======================================================
 
 const bookToken = async (req, res, next) => {

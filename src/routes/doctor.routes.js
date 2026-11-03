@@ -13,6 +13,8 @@ const {
   createPrescription,
   completeConsultation,
   getMedicines,
+  startOpd,
+  endOpd,
 } = require("../controllers/doctor.controller");
 
 const router = express.Router();
@@ -46,5 +48,14 @@ router.post("/prescriptions", createPrescription);
 
 // 9. Complete consultation
 router.post("/complete-consultation", completeConsultation);
+router.post(
+  "/opd/start",
+  startOpd
+);
+
+router.post(
+  "/opd/end",
+  endOpd
+);
 
 module.exports = router;

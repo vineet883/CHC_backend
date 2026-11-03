@@ -1,12 +1,14 @@
 const { pool } = require("../config/db");
-
+const {
+  ensureTodayOpdSessions,
+} = require("../services/opdSessionScheduler");
 // ========================================
 // GET TODAY'S DOCTOR OPD
 // ========================================
 
 const getToday = async (req, res, next) => {
   try {
-    const doctorId = req.user.doctorId;
+    const doctorId = req.user?.doctorId;
 
     if (!doctorId) {
       return res.status(401).json({
@@ -14,21 +16,28 @@ const getToday = async (req, res, next) => {
         message: "Doctor identity not found",
       });
     }
-
+await ensureTodayOpdSessions();
     const [rows] = await pool.query(
       `
       SELECT
         dra.id AS assignment_id,
 
-        COALESCE(os.id, NULL) AS opd_session_id,
+        CURDATE() AS opd_date,
 
-        dra.assignment_date AS opd_date,
+        dra.start_time AS assigned_start_time,
+        dra.end_time AS assigned_end_time,
 
-        COALESCE(os.status, 'NOT_STARTED') AS status,
+        os.id AS opd_session_id,
+
+        COALESCE(
+          os.status,
+          'NOT_STARTED'
+        ) AS status,
 
         os.token_start_time,
-        os.consultation_start_time,
         os.token_close_time,
+        os.started_at,
+        os.ended_at,
         os.current_token_number,
 
         d.id AS doctor_id,
@@ -38,27 +47,36 @@ const getToday = async (req, res, next) => {
 
         r.id AS room_id,
         r.room_number,
-        r.room_name
+        r.room_name,
+        r.floor
 
       FROM doctor_room_assignments dra
 
       INNER JOIN doctors d
         ON d.id = dra.doctor_id
+        AND d.is_active = TRUE
 
       INNER JOIN rooms r
         ON r.id = dra.room_id
+        AND r.is_active = TRUE
+
+      INNER JOIN doctor_weekly_schedule dws
+        ON dws.doctor_id = dra.doctor_id
+        AND dws.day_of_week = UPPER(DAYNAME(CURDATE()))
+        AND dws.is_active = TRUE
 
       LEFT JOIN opd_sessions os
         ON os.doctor_id = dra.doctor_id
         AND os.room_id = dra.room_id
-        AND os.opd_date = dra.assignment_date
+        AND os.opd_date = CURDATE()
 
       WHERE dra.doctor_id = ?
-        AND dra.assignment_date = CURDATE()
         AND dra.is_active = TRUE
+        AND dra.is_recurring = TRUE
+        AND dra.assignment_date <= CURDATE()
 
       ORDER BY
-        os.id DESC,
+        dra.assignment_date DESC,
         dra.id DESC
 
       LIMIT 1
@@ -69,16 +87,49 @@ const getToday = async (req, res, next) => {
     if (rows.length === 0) {
       return res.status(404).json({
         success: false,
-        message: "No room assignment found for today",
+        message: "No active OPD assignment found for today",
+        data: null,
       });
     }
 
+    const row = rows[0];
+
     return res.status(200).json({
       success: true,
-      data: rows[0],
+      message: "Today's OPD fetched successfully",
+
+      data: {
+        assignment_id: row.assignment_id,
+
+        doctor_id: row.doctor_id,
+        doctor_code: row.doctor_code,
+        doctor_name: row.doctor_name,
+        specializations: row.specializations,
+
+        room_id: row.room_id,
+        room_number: row.room_number,
+        room_name: row.room_name,
+        floor: row.floor,
+
+        opd_session_id: row.opd_session_id,
+        opd_date: row.opd_date,
+        status: row.status,
+
+        start_time: row.token_start_time || row.assigned_start_time,
+
+        end_time: row.token_close_time || row.assigned_end_time,
+
+        started_at: row.started_at,
+        ended_at: row.ended_at,
+
+        current_token_number: row.current_token_number ?? 0,
+      },
     });
   } catch (error) {
-    next(error);
+    console.error("Get today's doctor OPD error:", error);
+    console.error("SQL error code:", error.code);
+    console.error("SQL error message:", error.sqlMessage);
+    return next(error);
   }
 };
 
@@ -836,6 +887,139 @@ const getMedicines = async (req, res, next) => {
   }
 };
 
+
+// START OPD
+
+const startOpd = async (req, res, next) => {
+  let connection;
+
+  try {
+    const doctorId = req.user?.doctorId;
+    const { opdSessionId } = req.body;
+
+    if (!doctorId) {
+      return res.status(401).json({
+        success: false,
+        message: "Doctor identity not found",
+      });
+    }
+
+    if (!opdSessionId) {
+      return res.status(400).json({
+        success: false,
+        message: "opdSessionId is required",
+      });
+    }
+
+    // Ensure today's scheduled session exists.
+    await ensureTodayOpdSessions();
+
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // Ownership, date and status are checked together.
+    const [result] = await connection.query(
+      `
+      UPDATE opd_sessions
+      SET
+        status = 'RUNNING',
+        started_at = NOW(),
+        ended_at = NULL
+      WHERE id = ?
+        AND doctor_id = ?
+        AND opd_date = CURDATE()
+        AND status = 'NOT_STARTED'
+      `,
+      [opdSessionId, doctorId]
+    );
+
+    if (result.affectedRows === 0) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        success: false,
+        message:
+          "OPD cannot be started. It may not belong to you, may not be scheduled today, or may already have started.",
+      });
+    }
+
+    await connection.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: "OPD started successfully",
+      status: "RUNNING",
+      opdSessionId,
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+
+    return next(error);
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+};
+
+
+// END OPD
+
+const endOpd = async (req, res, next) => {
+  try {
+    const doctorId = req.user?.doctorId;
+    const { opdSessionId } = req.body;
+
+    if (!doctorId) {
+      return res.status(401).json({
+        success: false,
+        message: "Doctor identity not found",
+      });
+    }
+
+    if (!opdSessionId) {
+      return res.status(400).json({
+        success: false,
+        message: "opdSessionId is required",
+      });
+    }
+
+    const [result] = await pool.query(
+      `
+      UPDATE opd_sessions
+      SET
+        status = 'ENDED',
+        ended_at = NOW()
+      WHERE id = ?
+        AND doctor_id = ?
+        AND opd_date = CURDATE()
+        AND status = 'RUNNING'
+      `,
+      [opdSessionId, doctorId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "OPD cannot be ended. It may not belong to you or may not be running.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "OPD ended successfully",
+      status: "ENDED",
+      opdSessionId,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+
 module.exports = {
   getToday,
   getPatients,
@@ -847,4 +1031,6 @@ module.exports = {
   getCurrentPatient,
   createPrescription,
   completeConsultation,
+  startOpd,
+  endOpd,
 };
